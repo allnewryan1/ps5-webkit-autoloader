@@ -4,24 +4,70 @@
 <title>WebKit Autoloader v[[VERSION_PLACEHOLDER]] by PLK (built [[BUILD_TIME_PLACEHOLDER]])</title>
 <body style="background:#111;color:#eee;font:24px sans-serif;margin:10%">
 <p id="status">Loading...</p>
+<div id="choice" hidden>
+  <p id="choiceHint" style="font-size:20px;color:#cbd5e1"></p>
+  <p>
+    <button type="button" id="poops" style="font:24px sans-serif;margin:12px;padding:16px 28px">Poops</button>
+    <button type="button" id="relapse" style="font:24px sans-serif;margin:12px;padding:16px 28px">Relapse</button>
+  </p>
+</div>
 <script>
 (function () {
   // Both chain pages are cached, so this pointer only has to pick one. The choice
   // was recorded by the installer on this same origin, so it is readable here
-  // with no server running.
+  // with no server running. If website data was cleared, the cache can still be
+  // here while localStorage is not: a single usable chain is restored, and a
+  // console that can run both is asked again. Nothing is downloaded either way.
   var version = '[[VERSION_PLACEHOLDER]]';
   var base = '/app/[[APP_DIR_PLACEHOLDER]]/';
-  var chain = null;
-  try { chain = window.localStorage.getItem('wkal_exploit'); } catch (error) { chain = null; }
-  if (chain !== 'poops' && chain !== 'relapse') {
-    document.getElementById('status').textContent = 'No exploit was chosen. Run the installer again.';
-    return;
+  var status = document.getElementById('status');
+  var choiceBox = document.getElementById('choice');
+
+  function readChain() {
+    try { return window.localStorage.getItem('wkal_exploit'); } catch (error) { return null; }
   }
+  function writeChain(chain) {
+    try { window.localStorage.setItem('wkal_exploit', chain); } catch (error) {}
+  }
+  function go(chain) {
+    writeChain(chain);
+    location.replace(base + chain + '.html');
+  }
+
+  var match = /PlayStation 5\/(\d+\.\d+)/.exec(navigator.userAgent || '');
+  var fw = match ? parseFloat(match[1]) : 0;
+  var hasPoops = !match || (fw >= 7 && fw <= 12);
+  var hasRelapse = !match || (fw >= 7 && fw <= 13.60 && fw !== 9.05 && fw !== 11.40);
+  var chain = readChain();
+  if (chain !== 'poops' && chain !== 'relapse') chain = null;
+  if (chain === 'poops' && !hasPoops) chain = null;
+  if (chain === 'relapse' && !hasRelapse) chain = null;
+
   fetch(base + '__complete__').then(function (r) { return r.text(); }).then(function (marker) {
     if (marker.trim() !== version) throw new Error('Cache incomplete');
-    location.replace(base + chain + '.html');
+    if (chain) {
+      location.replace(base + chain + '.html');
+      return;
+    }
+    if (!hasPoops && !hasRelapse) {
+      status.textContent = 'Unsupported firmware. Run the installer again.';
+      return;
+    }
+    var only = hasPoops && !hasRelapse ? 'poops' : hasRelapse && !hasPoops ? 'relapse' : null;
+    if (only) {
+      go(only);
+      return;
+    }
+    status.textContent = 'Choose which exploit to launch.';
+    document.getElementById('choiceHint').textContent =
+      'Website data was cleared, but the offline cache is still here. Nothing will be downloaded again.';
+    choiceBox.hidden = false;
+    document.getElementById('poops').hidden = !hasPoops;
+    document.getElementById('relapse').hidden = !hasRelapse;
+    if (hasPoops) document.getElementById('poops').onclick = function () { go('poops'); };
+    if (hasRelapse) document.getElementById('relapse').onclick = function () { go('relapse'); };
   }).catch(function () {
-    document.getElementById('status').textContent = 'Cache incomplete. Run the installer again.';
+    status.textContent = 'Cache incomplete. Run the installer again.';
   });
 })();
 </script>

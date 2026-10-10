@@ -13,7 +13,7 @@ function setup(file, options = {}) {
     .replaceAll('[[VERSION_PLACEHOLDER]]', 'test-version')
     .replaceAll('[[APP_DIR_PLACEHOLDER]]', 'test-version');
   const nodes = Object.fromEntries(['status', 'repair', 'choice', 'poops', 'relapse', 'progress', 'percent', 'detail', 'progressBar', 'logContainer',
-    'cacheCorruptOverlay', 'cancelRepair', 'repairMessage']
+    'cacheCorruptOverlay', 'cancelRepair', 'repairMessage', 'choiceHint']
     .map(key => [key, { hidden: true, className: '', textContent: '', style: {}, focus() {},
       setAttribute(key, value) { this[key] = String(value); },
       removeAttribute(key) { delete this[key]; } }]));
@@ -250,8 +250,29 @@ const dual = options => setup('frontend/installer-page/index.html',
   }
   const unchosen = setup('frontend/pointer/index.html', {});
   await flush();
-  assert.equal(unchosen.target(), undefined, 'no choice means no redirect');
-  assert.match(unchosen.nodes.status.textContent, /installer again/);
+  assert.equal(unchosen.target(), undefined, 'no firmware and no stored choice must not guess a chain');
+  assert.equal(unchosen.nodes.choice.hidden, false);
+  assert.match(unchosen.nodes.status.textContent, /Choose which exploit/);
+  unchosen.nodes.relapse.onclick();
+  assert.equal(unchosen.target(), '/app/test-version/relapse.html');
+  assert.equal(unchosen.saved.get('wkal_exploit'), 'relapse');
+
+  // Website data cleared, cache still present: the only chain this firmware
+  // can run is restored without a reinstall. A stored chain it cannot run is
+  // discarded rather than launched.
+  const restored = setup('frontend/pointer/index.html', { fw: '13.60' });
+  await flush();
+  assert.equal(restored.target(), '/app/test-version/relapse.html');
+  assert.equal(restored.saved.get('wkal_exploit'), 'relapse');
+  const staleChain = setup('frontend/pointer/index.html', { fw: '9.05', seed: { wkal_exploit: 'relapse' } });
+  await flush();
+  assert.equal(staleChain.target(), '/app/test-version/poops.html');
+  const askAgain = setup('frontend/pointer/index.html', { fw: '11.00' });
+  await flush();
+  assert.equal(askAgain.target(), undefined);
+  assert.equal(askAgain.nodes.choice.hidden, false);
+  askAgain.nodes.poops.onclick();
+  assert.equal(askAgain.target(), '/app/test-version/poops.html');
 
   console.log('Installer checks passed: cache events, marker, choice gating, errors, repair and pointer.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

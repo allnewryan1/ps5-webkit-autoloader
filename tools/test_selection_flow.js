@@ -85,19 +85,24 @@ function loadPointer(options) {
   const code = html.match(/<script>([\s\S]*?)<\/script>/)[1]
     .replaceAll('[[VERSION_PLACEHOLDER]]', 'test-version')
     .replaceAll('[[APP_DIR_PLACEHOLDER]]', 'test-version');
-  const nodes = { status: { textContent: '' } };
+  const nodes = Object.fromEntries(['status', 'choice', 'poops', 'relapse', 'choiceHint']
+    .map(key => [key, { hidden: true, textContent: '' }]));
   const saved = new Map(Object.entries(options.seed || {}));
   let target;
   const sandbox = {
     document: { getElementById: key => nodes[key] },
-    localStorage: { getItem: key => (saved.has(key) ? saved.get(key) : null) },
+    navigator: { userAgent: options.fw ? 'PlayStation 5/' + options.fw : 'Mozilla/5.0' },
+    localStorage: {
+      getItem: key => (saved.has(key) ? saved.get(key) : null),
+      setItem: (key, value) => { saved.set(key, value); },
+    },
     location: { replace: path => { target = path; } },
     fetch: async () => ({ text: async () => (options.incomplete ? 'wrong' : 'test-version') }),
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox);
-  return { nodes, target: () => target };
+  return { nodes, saved, target: () => target };
 }
 
 const only = fw => {
@@ -190,8 +195,16 @@ const only = fw => {
   }
   const unmarked = loadPointer({});
   await flush();
-  assert.equal(unmarked.target(), undefined, 'no choice means no redirect');
-  assert.match(unmarked.nodes.status.textContent, /installer again/);
+  assert.equal(unmarked.target(), undefined, 'no firmware and no choice must not guess a chain');
+  assert.match(unmarked.nodes.status.textContent, /Choose which exploit/);
+  const restored = loadPointer({ fw: '13.60' });
+  await flush();
+  assert.equal(restored.target(), '/app/test-version/relapse.html',
+    'a cleared choice on a single-chain firmware must be restored from the cache');
+  const rejected = loadPointer({ fw: '12.02', seed: { wkal_exploit: 'poops' } });
+  await flush();
+  assert.equal(rejected.target(), '/app/test-version/relapse.html',
+    'a stored chain this firmware cannot run must not be launched');
 
   // 7. both chain pages are always cached, so switching costs nothing
   const registry = fs.readFileSync('tools/gen_file_registry.py', 'utf8');

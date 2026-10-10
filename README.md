@@ -83,6 +83,20 @@ The latest installer payload will re-create the homescreen app and refresh the c
 </Details>
 
 <Details>
+<Summary><i>The shortcut says the cache is incomplete, or asks me to choose again?</i></Summary>
+
+Clearing cookies and website data removes the saved exploit choice, but it does not always remove the offline cache. Launch **WebKit Autoloader** again. If your firmware only supports one chain, it continues on its own. If it supports both, pick Poops or Relapse — nothing is downloaded again.
+
+If the page says the cache is incomplete, run the installer once more. Payloads and `autoload.txt` are not touched.
+</Details>
+
+<Details>
+<Summary><i>Autoload says the ELF loader did not start?</i></Summary>
+
+The page waits about 30 seconds for elfldr and retries the transfer if the loader drops the connection while it is still starting. If it still fails, reboot and launch the shortcut again. On 12.40 and newer, wait a few minutes after the console reaches the homescreen before launching — starting the chain immediately is a common cause of a shutdown.
+</Details>
+
+<Details>
 <Summary><i>How to use a custom ELF Loader?</i></Summary>
 
 The autoloader uses a custom version of **elfldr** that only accepts connections from the PS5 itself (localhost). This improves security by preventing unauthorized devices on your network from sending payloads to your console.

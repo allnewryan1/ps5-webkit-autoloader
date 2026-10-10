@@ -50,16 +50,33 @@ static pid_t find_pid(const char *name) {
     /* KERN_PROC_ALL scan — raw offsets into FreeBSD 12's struct kinfo_proc
      * as exposed by the PS5 kernel: ki_pid at offset 72, ki_tdname at 447
      * (matches the layout used by the ps5-payload-dev SDK's klib). These
-     * are ABI-specific; re-check if the kernel struct ever changes. */
-    for (uint8_t *ptr = buf; ptr < (buf + buf_size);) {
+     * are ABI-specific; re-check if the kernel struct ever changes.
+     * A zero or truncated record used to spin this loop forever, which left
+     * the installer running with no page on screen. */
+    for (uint8_t *ptr = buf; ptr + sizeof(int) <= buf + buf_size;) {
         int ki_structsize = *(int *)ptr;
+        if (ki_structsize < 447 + 20 ||
+            (size_t)ki_structsize > (size_t)((buf + buf_size) - ptr))
+            break;
         pid_t ki_pid = *(pid_t *)&ptr[72];
         char *ki_tdname = (char *)&ptr[447];
+        size_t name_cap = (size_t)ki_structsize - 447;
+
+        int same = 1;
+        for (size_t i = 0; i < name_cap; i++) {
+            if (ki_tdname[i] != name[i]) {
+                same = 0;
+                break;
+            }
+            if (name[i] == '\0')
+                break;
+            if (i + 1 == name_cap)
+                same = 0;
+        }
 
         ptr += ki_structsize;
-        if (!strcmp(name, ki_tdname) && ki_pid != mypid) {
+        if (same && ki_pid > 0 && ki_pid != mypid)
             pid = ki_pid;
-        }
     }
 
     free(buf);
@@ -80,10 +97,12 @@ int main(void) {
 
     syscall(SYS_thr_set_name, -1, WKALI_THREAD_NAME);
 
-    /* Kill previous installer instances */
-    while ((pid = find_pid(WKALI_THREAD_NAME)) > 0) {
-        if (kill(pid, SIGKILL)) {
-            installer_log("[WKALI] kill failed\n");
+    /* Kill previous installer instances. A process that survives SIGKILL must
+     * not leave us sleeping forever with the port still taken. */
+    for (int tries = 0; (pid = find_pid(WKALI_THREAD_NAME)) > 0; tries++) {
+        if (tries >= 8 || kill(pid, SIGKILL)) {
+            installer_log("[WKALI] could not stop previous installer (pid %d)\n", (int)pid);
+            installer_notify("WebKit Autoloader Installer: Error\nA previous installer is still running. Reboot and try again.");
             return EXIT_FAILURE;
         }
         sleep(1);
@@ -114,11 +133,15 @@ int main(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
 
-    /* Start the MHD daemon using a thread pool to handle concurrent AppCache requests. */
-    daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_DEBUG,
+    /* Thread pool for concurrent AppCache requests. Debug mode is left off:
+     * its extra checks abort the process, which looks like a freeze on the
+     * console. 180s drops a client that connected and then stopped reading
+     * without cutting off the one-second log poll. */
+    daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD,
                               WKALI_PORT, NULL, NULL, &http_on_request,
-                              NULL, 
+                              NULL,
                               MHD_OPTION_THREAD_POOL_SIZE, (unsigned int)8,
+                              MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)180,
                               MHD_OPTION_END);
 
     if (NULL == daemon) {

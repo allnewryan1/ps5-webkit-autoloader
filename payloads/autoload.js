@@ -7,8 +7,23 @@
 // process over.
 const NR = { SOCKET: 0x61, CONNECT: 0x62, WRITE: 4, CLOSE: 6, MMAP: 0x1dd, MUNMAP: 0x49 };
 
+// Relapse brings the loader up slowly on purpose. 120 * 250ms is half a minute,
+// which covers that without spinning forever when nothing is listening.
+const CONNECT_TRIES = 120;
+const CONNECT_WAIT_MS = 250;
+// A listener that accepts and then drops the socket (loader still starting) must
+// be given a fresh connection and the whole file again. Resuming mid-file on a
+// new connection is not a valid ELF.
+const HANDOFFS = 4;
+const WRITE_CHUNK = 0x4000;
+const WRITE_STALLS = 4;
+
 function failed(value) {
   return (value.low | 0) === -1;
+}
+
+function pause(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function connect(api) {
@@ -28,6 +43,11 @@ async function connect(api) {
   }
   await api.chain.syscall(NR.CLOSE, fd);
   return -1;
+}
+
+async function closeFd(api, fd) {
+  if (fd < 0) return;
+  try { await api.chain.syscall(NR.CLOSE, fd); } catch (error) { /* already closed */ }
 }
 
 async function loadElf(api) {
@@ -55,6 +75,47 @@ async function loadElf(api) {
   }
 }
 
+async function sendElf(api, elf) {
+  let lastError = null;
+  for (let handoff = 0; handoff < HANDOFFS; handoff++) {
+    let fd = -1;
+    try {
+      for (let attempt = 0; attempt < CONNECT_TRIES; attempt++) {
+        fd = await connect(api);
+        if (fd >= 0) break;
+        await pause(CONNECT_WAIT_MS);
+      }
+      if (fd < 0) throw new Error("The ELF loader did not start on port 9021.");
+      let sent = 0;
+      let stalls = 0;
+      while (sent < elf.size) {
+        const want = Math.min(WRITE_CHUNK, elf.size - sent);
+        const result = await api.chain.syscall(NR.WRITE, fd, elf.base.add32(sent), want);
+        const count = result.low | 0;
+        // A zero or negative count is a dropped loader, not a finished file.
+        // A few stalls on the same socket are retried; then the whole ELF is
+        // sent again on a new connection.
+        if (count <= 0 || count > want) {
+          if (++stalls >= WRITE_STALLS)
+            throw new Error("ELF transfer failed after " + sent + " bytes.");
+          await pause(50);
+          continue;
+        }
+        stalls = 0;
+        sent += count;
+      }
+      await api.log("Autoload: sent " + sent + " bytes of " + elf.name + " to elfldr.", "success");
+      await closeFd(api, fd);
+      return;
+    } catch (error) {
+      lastError = error;
+      await closeFd(api, fd);
+      if (handoff + 1 < HANDOFFS) await pause(300);
+    }
+  }
+  throw lastError;
+}
+
 return async function (api) {
   // Payload three of three, so the exploit has already run. If it did not publish
   // kernel access then nothing was achieved and no ELF should be sent.
@@ -62,29 +123,9 @@ return async function (api) {
 
   const elf = await loadElf(api);
   await api.log("Autoload: staging " + elf.name + " (" + elf.size + " bytes)...", "info");
-  let fd = -1;
   try {
-    // The exploit brings elfldr up itself; give it a moment to start listening.
-    for (let attempt = 0; attempt < 50; attempt++) {
-      fd = await connect(api);
-      if (fd >= 0) break;
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    if (fd < 0) throw new Error("The ELF loader did not start on port 9021.");
-    let sent = 0;
-    while (sent < elf.size) {
-      const want = Math.min(0x10000, elf.size - sent);
-      const result = await api.chain.syscall(NR.WRITE, fd, elf.base.add32(sent), want);
-      const count = result.low | 0;
-      if (count <= 0 || count > want) throw new Error("ELF transfer failed after " + sent + " bytes.");
-      sent += count;
-    }
-    await api.log("Autoload: sent " + sent + " bytes of " + elf.name + " to elfldr.", "success");
+    await sendElf(api, elf);
   } finally {
-    try {
-      if (fd >= 0) await api.chain.syscall(NR.CLOSE, fd);
-    } finally {
-      await api.chain.syscall(NR.MUNMAP, elf.base, elf.mapped);
-    }
+    await api.chain.syscall(NR.MUNMAP, elf.base, elf.mapped);
   }
 };

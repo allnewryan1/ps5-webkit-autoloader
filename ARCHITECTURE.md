@@ -165,8 +165,11 @@ The cache layout is:
 ```
 
 The pointer checks the marker before navigating, then sends the user to the chain
-page they chose, so partial cache downloads cannot start the app. The HTTP server
-serves the standalone chain pages verbatim. It withholds the installer's manifest
+page they chose, so partial cache downloads cannot start the app. If that choice
+is missing (website data cleared) or names a chain this firmware cannot run, a
+single usable chain is restored and a dual-chain firmware is asked again. Both
+pages are already in the cache, so this does not download anything and does not
+need the installer. The HTTP server serves the standalone chain pages verbatim. It withholds the installer's manifest
 attribute until a supported choice is present, as described above.
 
 `SIMULATE=1|2` and `tools/build_cache_corruption_test_elfs.sh` are available for

@@ -666,10 +666,12 @@
   pollLogs();
   cache.addEventListener('downloading', function () {
     downloading = true;
+    lastBeat = Date.now();
     appendLog('[AppCache] Downloading offline content...\n');
   });
   cache.addEventListener('progress', function (event) {
     if (failed || cacheReady) return;
+    lastBeat = Date.now();
     if (event.total > 0) {
       var value = Math.min(99, Math.round(event.loaded * 100 / event.total));
       setProgress(value);
@@ -708,6 +710,30 @@
     if (failed || cacheReady || installing) return;
     status.textContent = 'The cached manifest was superseded. Re-run the installer to finish.';
   });
+  var lastBeat = Date.now();
+  function watchStall() {
+    setTimeout(function () {
+      if (cacheReady || failed) return;
+      if (downloading && Date.now() - lastBeat >= 60000) {
+        fail('Cache download stalled. Run the installer again or clear WebKit data.');
+        return;
+      }
+      watchStall();
+    }, 15000);
+  }
+  watchStall();
+  setTimeout(function () {
+    if (cacheReady || failed || downloading) return;
+    // The manifest check never became a download. One quiet reload, then the
+    // same repair a corrupt cache already uses. A second copy of this page
+    // sees retry=1 and does not reload again.
+    if (params.get('retry') !== '1') {
+      params.set('retry', '1');
+      location.replace(location.pathname + '?' + params.toString());
+      return;
+    }
+    fail('The offline cache did not start. Run the installer again or clear WebKit data.');
+  }, 90000);
   setTimeout(function () {
     if (!cacheReady && !failed) {
       status.textContent = 'Caching is taking unusually long';

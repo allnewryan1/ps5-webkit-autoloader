@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <unistd.h>
 #include <microhttpd.h>
 
 #include "wkali.h"
@@ -37,6 +38,96 @@ atomic_int install_completed = 0;
  * visible to the main loop. */
 atomic_int webkit_data_cleared = 0;
 
+/* One /install at a time. A duplicate AppCache completion event used to start
+ * a second install or report failure while the first was still working. */
+static atomic_int install_once = 0;
+
+/* Inflated registry entries, reused across the thread pool. AppCache fetches
+ * the chain pages in parallel; inflating each one per request (~9 MB) was
+ * enough to run the installer out of memory and leave a half-written cache. */
+#define INFLATE_CACHE_SLOTS 16
+struct Inflated {
+    const FileEntry *entry;
+    unsigned char *data;
+    size_t size;
+};
+static struct Inflated inflate_cache[INFLATE_CACHE_SLOTS];
+static atomic_flag inflate_lock = ATOMIC_FLAG_INIT;
+
+static void inflate_lock_acquire(void) {
+    unsigned spins = 0;
+    while (atomic_flag_test_and_set_explicit(&inflate_lock, memory_order_acquire)) {
+        if (++spins > 64)
+            usleep(1000);
+    }
+}
+
+static void inflate_lock_release(void) {
+    atomic_flag_clear_explicit(&inflate_lock, memory_order_release);
+}
+
+/* 0 = served, -1 = out of memory, -2 = inflate error.
+ * Compressed hits are persistent for the life of the installer. */
+static int open_entry(const FileEntry *entry, void **payload, size_t *payload_size,
+                      enum MHD_ResponseMemoryMode *mem_mode) {
+    if (!entry->compressed) {
+        *payload = (void *)entry->data;
+        *payload_size = entry->size;
+        *mem_mode = MHD_RESPMEM_PERSISTENT;
+        return 0;
+    }
+
+    inflate_lock_acquire();
+    for (int i = 0; i < INFLATE_CACHE_SLOTS; i++) {
+        if (inflate_cache[i].entry == entry) {
+            *payload = inflate_cache[i].data;
+            *payload_size = inflate_cache[i].size;
+            *mem_mode = MHD_RESPMEM_PERSISTENT;
+            inflate_lock_release();
+            return 0;
+        }
+    }
+
+    unsigned char *decompressed = malloc(entry->orig_size + 1);
+    if (!decompressed) {
+        inflate_lock_release();
+        return -1;
+    }
+    unsigned long destlen = entry->orig_size;
+    unsigned long sourcelen = entry->size;
+    int err = puff(decompressed, &destlen, entry->data, &sourcelen);
+    if (err != 0) {
+        free(decompressed);
+        inflate_lock_release();
+        return -2;
+    }
+    decompressed[destlen] = '\0';
+
+    int slot = -1;
+    for (int i = 0; i < INFLATE_CACHE_SLOTS; i++) {
+        if (!inflate_cache[i].entry) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 0) {
+        inflate_cache[slot].entry = entry;
+        inflate_cache[slot].data = decompressed;
+        inflate_cache[slot].size = destlen;
+        *mem_mode = MHD_RESPMEM_PERSISTENT;
+    } else {
+        *mem_mode = MHD_RESPMEM_MUST_FREE;
+    }
+    *payload = decompressed;
+    *payload_size = destlen;
+    inflate_lock_release();
+    return 0;
+}
+
+static struct MHD_Response *plain_response(const char *text) {
+    return MHD_create_response_from_buffer(strlen(text), (void *)text, MHD_RESPMEM_PERSISTENT);
+}
+
 /* Which chains this request's firmware supports: 1 = Poops, 2 = Relapse, 3 = both.
  * Read from the User-Agent, or a ?fw= argument for desktop testing. Recomputed
  * per request and never stored: a remembered choice was what got wiped
@@ -46,7 +137,10 @@ static int supported_chains(struct MHD_Connection *conn) {
     const char *ps5 = ua ? strstr(ua, "PlayStation 5/") : NULL;
     const char *fw_arg = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "fw");
     float fw = ps5 ? strtof(ps5 + 14, NULL) : (fw_arg ? strtof(fw_arg, NULL) : 0);
-    if (fw == 0) return 3; /* desktop preview */
+    /* A PlayStation UA we could not parse must not be treated as a desktop
+     * preview. Guessing both chains there runs an exploit the firmware table
+     * does not know and kernel-panics. */
+    if (fw == 0) return ps5 ? 0 : 3;
     int poops = fw >= 7 && fw <= 12;
     int relapse = fw >= 7 && fw <= 13.60f && fw != 9.05f && fw != 11.40f;
     return poops | (relapse << 1);
@@ -115,22 +209,42 @@ enum MHD_Result http_on_request(void *cls, struct MHD_Connection *conn,
          * homescreen app is only installed/updated now — never on startup —
          * so a shortcut is never created for a partial cache. On failure the
          * server stays up and the page tells the user to re-run the installer. */
-        int err = installer_install_app_if_needed();
-        if (err == 0) {
-            installer_log("[WKALI] App installed. Stopping server...\n");
-            resp = MHD_create_response_from_buffer(strlen("OK"), (void *)"OK",
-                                                   MHD_RESPMEM_PERSISTENT);
+        if (atomic_load(&install_completed)) {
+            resp = plain_response("OK");
             MHD_add_response_header(resp, "Content-Type", "text/plain");
             http_status = MHD_HTTP_OK;
-            atomic_store(&install_completed, 1);
-            atomic_store(&http_keep_running, 0);
         } else {
-            installer_log("[WKALI] App install failed (%d). Staying up.\n", err);
-            const char *fail = "Install failed";
-            resp = MHD_create_response_from_buffer(strlen(fail), (void *)fail,
-                                                   MHD_RESPMEM_PERSISTENT);
-            MHD_add_response_header(resp, "Content-Type", "text/plain");
-            http_status = MHD_HTTP_INTERNAL_SERVER_ERROR;
+            int expected = 0;
+            if (!atomic_compare_exchange_strong(&install_once, &expected, 1)) {
+                for (int i = 0; i < 200 && !atomic_load(&install_completed); i++)
+                    usleep(50000);
+                if (atomic_load(&install_completed)) {
+                    resp = plain_response("OK");
+                    http_status = MHD_HTTP_OK;
+                } else {
+                    installer_log("[WKALI] App install still in progress or failed.\n");
+                    resp = plain_response("Install failed");
+                    http_status = MHD_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                MHD_add_response_header(resp, "Content-Type", "text/plain");
+            } else {
+                int err = installer_install_app_if_needed();
+                if (err == 0) {
+                    installer_log("[WKALI] App installed. Stopping server...\n");
+                    resp = plain_response("OK");
+                    MHD_add_response_header(resp, "Content-Type", "text/plain");
+                    http_status = MHD_HTTP_OK;
+                    atomic_store(&install_completed, 1);
+                    atomic_store(&http_keep_running, 0);
+                } else {
+                    installer_log("[WKALI] App install failed (%d). Staying up.\n", err);
+                    resp = plain_response("Install failed");
+                    MHD_add_response_header(resp, "Content-Type", "text/plain");
+                    http_status = MHD_HTTP_INTERNAL_SERVER_ERROR;
+                    /* Let a later retry try again. The previous install is intact. */
+                    atomic_store(&install_once, 0);
+                }
+            }
         }
     } else if (strcmp(url, ROUTE_EXIT) == 0) {
         installer_log("[WKALI] Exit requested by client. Stopping server...\n");
@@ -195,47 +309,22 @@ enum MHD_Result http_on_request(void *cls, struct MHD_Connection *conn,
             if (strcmp(url, ROUTE_INDEX) != 0 && strcmp(url, "/logs") != 0) {
                 installer_log("[HTTP] Serving %s (size: %u)\n", url, entry->size);
             }
-            void *payload = (void *)entry->data;
-            size_t payload_size = entry->size;
+            void *payload = NULL;
+            size_t payload_size = 0;
             enum MHD_ResponseMemoryMode mem_mode = MHD_RESPMEM_PERSISTENT;
-            unsigned char *decompressed = NULL;
 
-            if (entry->compressed) {
-                /* Inflate the raw-DEFLATE blob (installer/common/inflate.c, vendored puff)
-                 * into a fresh heap buffer; MHD frees it with MUST_FREE. */
-                decompressed = malloc(entry->orig_size + 1);
-                if (!decompressed) {
-                    const char *oom = "503 Out of Memory\n";
-                    resp = MHD_create_response_from_buffer(strlen(oom),
-                                                           (void *)oom,
-                                                           MHD_RESPMEM_PERSISTENT);
-                    MHD_add_response_header(resp, "Content-Type", "text/plain");
-                    http_status = MHD_HTTP_SERVICE_UNAVAILABLE;
-                    add_cors_headers(resp);
-                    enum MHD_Result ret = MHD_queue_response(conn, http_status, resp);
-                    MHD_destroy_response(resp);
-                    return ret;
-                }
-                unsigned long destlen = entry->orig_size;
-                unsigned long sourcelen = entry->size;
-                int err = puff(decompressed, &destlen, entry->data, &sourcelen);
-                if (err != 0) {
-                    free(decompressed);
-                    const char *bad = "500 Inflate Error\n";
-                    resp = MHD_create_response_from_buffer(strlen(bad),
-                                                           (void *)bad,
-                                                           MHD_RESPMEM_PERSISTENT);
-                    MHD_add_response_header(resp, "Content-Type", "text/plain");
-                    http_status = MHD_HTTP_INTERNAL_SERVER_ERROR;
-                    add_cors_headers(resp);
-                    enum MHD_Result ret = MHD_queue_response(conn, http_status, resp);
-                    MHD_destroy_response(resp);
-                    return ret;
-                }
-                decompressed[destlen] = '\0';
-                payload = decompressed;
-                payload_size = destlen;
-                mem_mode = MHD_RESPMEM_MUST_FREE;
+            int opened = open_entry(entry, &payload, &payload_size, &mem_mode);
+            if (opened != 0) {
+                const char *msg = opened == -1 ? "503 Out of Memory\n" : "500 Inflate Error\n";
+                resp = MHD_create_response_from_buffer(strlen(msg), (void *)msg,
+                                                       MHD_RESPMEM_PERSISTENT);
+                MHD_add_response_header(resp, "Content-Type", "text/plain");
+                http_status = opened == -1 ? MHD_HTTP_SERVICE_UNAVAILABLE
+                                           : MHD_HTTP_INTERNAL_SERVER_ERROR;
+                add_cors_headers(resp);
+                enum MHD_Result ret = MHD_queue_response(conn, http_status, resp);
+                MHD_destroy_response(resp);
+                return ret;
             }
 
 
